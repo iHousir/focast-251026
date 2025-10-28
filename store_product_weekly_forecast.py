@@ -264,15 +264,30 @@ def forecast_all(df: pd.DataFrame, horizon: int, min_observations: int = 8) -> T
     """
 
     summary = summarize_dataset(df)
-    results: List[ForecastResult] = []
-
+    candidate_series: List[Tuple[Tuple[str, str], Series]] = []
     for (store, product), series in weekly_series(df):
         if len(series) < min_observations:
             continue
+        candidate_series.append(((store, product), series))
+
+    total = len(candidate_series)
+    if total == 0:
+        print("No eligible store/product series found for forecasting.")
+        return [], summary
+
+    print(f"Preparing forecasts for {total} store/product series...")
+    step = max(1, total // 10)  # Update progress roughly every 10% of completion.
+
+    results: List[ForecastResult] = []
+    for idx, ((store, product), series) in enumerate(candidate_series, start=1):
         series.attrs["store_id"] = store
         series.attrs["product_id"] = product
         result = forecast_series(series, horizon)
         results.append(result)
+
+        if idx % step == 0 or idx == total:
+            progress_pct = (idx / total) * 100
+            print(f"Progress: {idx}/{total} series processed ({progress_pct:.0f}%)")
 
     return results, summary
 
