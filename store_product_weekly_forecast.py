@@ -33,7 +33,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -109,18 +109,21 @@ def summarize_dataset(df: pd.DataFrame) -> Dict[str, object]:
     return summary
 
 
-def weekly_series(df: pd.DataFrame) -> Iterable[Tuple[Tuple[str, str], Series]]:
+def weekly_series(df: pd.DataFrame) -> Iterator[Tuple[Tuple[str, str], Series]]:
     """Yield weekly aggregated sales series for each store/product pair."""
 
-    df = df.set_index("order_time").sort_index()
-    grouped = df.groupby(["store_id", "product_id"])
+    weekly = (
+        df.sort_values("order_time")
+        .set_index("order_time")
+        .groupby(["store_id", "product_id"])["quantity"]
+        .resample("W-MON", label="left", closed="left")
+        .sum()
+    )
 
-    for (store, product), sub_df in grouped:
-        weekly = (
-            sub_df["quantity"].resample("W-MON", label="left", closed="left").sum().dropna()
-        )
-        if len(weekly) >= 4:  # Require at least 4 observations to forecast.
-            yield (store, product), weekly
+    for (store, product), sub_series in weekly.groupby(level=[0, 1]):
+        series = sub_series.droplevel([0, 1])
+        if len(series) >= 4:  # Require at least 4 observations to forecast.
+            yield (store, product), series
 
 
 # ---------------------------------------------------------------------------
@@ -144,14 +147,14 @@ def _naive_forecast(train: Series, horizon: int) -> pd.Series:
 
 
 def _exponential_smoothing_forecast(train: Series, horizon: int) -> pd.Series:
-    seasonal_periods = max(2, min(52, len(train) // 2))
+    seasonal_periods = max(2, min(26, len(train) // 2))
     model = ExponentialSmoothing(
         train,
         seasonal_periods=seasonal_periods,
         seasonal="add",
         trend="add",
         initialization_method="estimated",
-    ).fit(optimized=True, use_brute=True)
+    ).fit(optimized=True, use_brute=False)
     forecast = model.forecast(horizon)
     return forecast.rename("holt_winters")
 
@@ -191,18 +194,30 @@ def select_best_model(series: Series, horizon: int) -> ForecastResult:
 
     candidates.append(("naive", _naive_forecast(train, horizon)))
 
+    train_std = float(train.std()) if len(train) > 1 else 0.0
+    if train_std < 1e-8:
+        # Flat series – skip expensive models.
+        return ForecastResult(
+            store_id="",
+            product_id="",
+            model_name="naive",
+            forecast=_naive_forecast(series, horizon),
+            metrics={"rmse": 0.0, "mae": 0.0, "mape": 0.0, "smape": 0.0},
+        )
+
     try:
         if len(train) >= 10:
             candidates.append(("holt_winters", _exponential_smoothing_forecast(train, horizon)))
     except Exception:
         pass
 
-    for order in [(0, 1, 1), (1, 1, 1)]:
-        try:
-            if len(train) >= 8:
-                candidates.append((f"sarimax_{order[0]}{order[1]}{order[2]}", _sarimax_forecast(train, horizon, order)))
-        except Exception:
-            continue
+    if len(train) <= 160 and train_std > 1e-8:
+        for order in [(0, 1, 1), (1, 1, 1)]:
+            try:
+                if len(train) >= 8:
+                    candidates.append((f"sarimax_{order[0]}{order[1]}{order[2]}", _sarimax_forecast(train, horizon, order)))
+            except Exception:
+                continue
 
     evaluations: List[Tuple[float, str, Series, Dict[str, float]]] = []
     for name, forecast in candidates:
